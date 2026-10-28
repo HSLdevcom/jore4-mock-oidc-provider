@@ -21,20 +21,66 @@ const defaultUsers = [
 	{sub: 'foo', idClaims: {name: 'Foo', email: 'foo@example.com'}},
 	{sub: 'bar', idClaims: {name: 'Bar', email: 'bar@example.com'}},
 ];
+const defaultClients = [{sub: 'baz'}];
 
 const createToken = () => randomBytes(16).toString('base64url');
 
+// omits absent parameters so that they are not serialized as the string 'undefined'
+const buildParams = (params) => new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined));
+
+// the redirect URI may already carry a query string of its own
+const addQuery = (uri, params) => {
+	const query = buildParams(params);
+	return query.size ? `${uri}${uri.includes('?') ? '&' : '?'}${query}` : uri;
+};
+
 const encodeVerifier = (verifier, challengeMethod) =>
-	challengeMethod === 'S256' ? createHash('sha256').update(verifier).digest('base64url') : verifier;
+	// a missing (or repeated) code_verifier can never match a challenge
+	typeof verifier !== 'string'
+		? undefined
+		: challengeMethod === 'S256'
+			? createHash('sha256').update(verifier).digest('base64url')
+			: verifier;
 
-const getIssuer = (req) => `${req.protocol}://${req.headers.host}/`; // ending in '/' for Auth0 compatibility
+// RFC 6749 §2.3.1: both values are form-urlencoded before the pair is encoded for basic authentication
+const decodeCredential = (value) => decodeURIComponent(value.replace(/\+/g, ' '));
 
-const buildBaseClaims = (req, ttl, aud) => {
-	const iss = getIssuer(req);
+// client_secret_post carries the client id in the body, client_secret_basic in the authorization header;
+// the secret itself is never checked, since any secret is accepted for a mock client
+const getClientId = (req) => {
+	const {client_id: clientId} = req.body;
+	if (typeof clientId === 'string') {
+		return clientId;
+	}
+	const header = req.headers.authorization;
+	if (!header || !/^Basic /i.test(header)) {
+		return undefined;
+	}
+	const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+	// the secret may contain colons of its own, so only the first one separates the two values
+	const separator = decoded.indexOf(':');
+	if (separator === -1) {
+		return undefined;
+	}
+	try {
+		return decodeCredential(decoded.slice(0, separator));
+	} catch {
+		return undefined; // malformed percent-encoding leaves no id to look up
+	}
+};
+
+// req.protocol and req.host follow the X-Forwarded-* headers, see the 'trust proxy' setting
+const getIssuer = (req, issuer) => issuer || `${req.protocol}://${req.host}/`; // ending in '/' for Auth0 compatibility
+
+// the endpoints live under the issuer, so a configured issuer also determines where they are published
+const getBaseUrl = (req, issuer) => getIssuer(req, issuer).replace(/\/$/, '');
+
+const buildBaseClaims = (req, issuer, ttl, aud) => {
+	const iss = getIssuer(req, issuer);
 	const iat = floor(Date.now() / 1000);
 	const nbf = iat - 5;
 	const exp = iat + ttl;
-	return {iss, aud, iat, nbf, exp, auth_time: iat};
+	return {iss, aud, iat, nbf, exp};
 };
 
 const signJwt = (header, payload, key) => new SignJWT(payload).setProtectedHeader(header).sign(key);
@@ -43,10 +89,11 @@ const buildHeader = (jwk) => ({typ: 'JWT', alg: 'RS256', kid: jwk.kid});
 
 const buildCookie = (sessionId) => `mock-auth=${sessionId}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=86400`;
 
-const sendToken = (req, res, session, jwk, signingKey, ttl, aud, scope, nonce) => {
+const sendToken = (req, res, session, issuer, jwk, signingKey, ttl, aud, scope, nonce) => {
 	const token = createToken();
 	const header = buildHeader(jwk);
-	const baseClaims = buildBaseClaims(req, ttl, aud);
+	// auth_time must stay at the original authentication, even when the token is refreshed later
+	const baseClaims = {...buildBaseClaims(req, issuer, ttl, aud), auth_time: session.authTime};
 	const {accessClaims: userAccessClaims, idClaims: userIdClaims, ...userClaims} = session.user;
 	const accessClaims = {...userClaims, ...userAccessClaims, ...baseClaims, scope};
 	const idClaims = {...userClaims, ...userIdClaims, ...baseClaims, nonce};
@@ -62,14 +109,20 @@ const sendToken = (req, res, session, jwk, signingKey, ttl, aud, scope, nonce) =
 		);
 };
 
-const sanitized = {'<': '&lt;', '>': '&gt;'};
-const sanitize = (string) => string.replace(/[<>]/g, (ch) => sanitized[ch]);
+const sanitized = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'};
+const sanitize = (value) => String(value).replace(/[&<>"]/g, (ch) => sanitized[ch]);
+
+// '<' is escaped so that a value containing '</script>' cannot break out of the inline script
+const toScriptJson = (value) => JSON.stringify(value).replace(/</g, '\\u003c');
 
 const renderOptions = (users) =>
-	users.map(({sub, idClaims}) => `<option value="${sub}">${idClaims?.name || sub}</option>`).join('');
+	users
+		.map(({sub, idClaims}) => `<option value="${sanitize(sub)}">${sanitize(idClaims?.name || sub)}</option>`)
+		.join('');
 
-const showErrorPage = (res, message) =>
-	res.setHeader('Cache-Control', 'no-cache').setHeader('Content-Type', 'text/html; charset=utf-8').end(`<!doctype html>
+const showPage = (res, heading, message, status = 200) =>
+	res.status(status).setHeader('Cache-Control', 'no-cache').setHeader('Content-Type', 'text/html; charset=utf-8')
+		.end(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -77,48 +130,57 @@ const showErrorPage = (res, message) =>
 <title>Mock Authentication</title>
 </head>
 <body>
-<h1>Error</h1>
+<h1>${heading}</h1>
 <p>${message}</p>
 </body>
 </html>`);
 
-const revokeSession = (req, res, sessions, uri) => {
+const showErrorPage = (res, message, status = 400) => showPage(res, 'Error', message, status);
+
+const revokeSession = (req, res, sessions, uri, state) => {
 	const sessionId = req.cookies['mock-auth'];
 	if (sessionId) {
 		sessions.delete(sessionId);
 		res.setHeader('Set-Cookie', `mock-auth=; Path=/; Max-Age=0`);
 	}
-	res.redirect(uri);
+	// the redirect URI is optional; without one the provider reports the outcome itself
+	if (typeof uri === 'string') {
+		res.redirect(addQuery(uri, {state}));
+	} else {
+		showPage(res, 'Signed out', 'You have been signed out.');
+	}
 };
 
-const handleOpenidConfiguration = (req, res) => {
-	const base = `${req.protocol}://${req.headers.host}`;
-	res.json({
-		issuer: getIssuer(req),
-		jwks_uri: `${base}/.well-known/jwks.json`,
-		authorization_endpoint: `${base}/authorize`,
-		token_endpoint: `${base}/oauth/token`,
-		revocation_endpoint: `${base}/oauth/revoke`,
-		end_session_endpoint: `${base}/oidc/logout`,
-		userinfo_endpoint: `${base}/userinfo`,
-		introspection_endpoint: `${base}/introspect`,
-		claims_supported: ['aud', 'email', 'exp', 'iat', 'iss', 'name', 'sub'],
-		code_challenge_methods_supported: supportedCodeChallengeMethods,
-		grant_types_supported: ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
-		id_token_signing_alg_values_supported: ['RS256'],
-		response_modes_supported: ['query'],
-		response_types_supported: ['code'],
-		scopes_supported: ['openid', 'profile', 'email'],
-		subject_types_supported: ['public'],
-		token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
-		token_endpoint_auth_signing_alg_values_supported: ['RS256'],
-	});
-};
+const handleOpenidConfiguration =
+	({issuer}) =>
+	(req, res) => {
+		const base = getBaseUrl(req, issuer);
+		res.json({
+			issuer: getIssuer(req, issuer),
+			jwks_uri: `${base}/.well-known/jwks.json`,
+			authorization_endpoint: `${base}/authorize`,
+			token_endpoint: `${base}/oauth/token`,
+			revocation_endpoint: `${base}/oauth/revoke`,
+			end_session_endpoint: `${base}/oidc/logout`,
+			userinfo_endpoint: `${base}/userinfo`,
+			introspection_endpoint: `${base}/introspect`,
+			claims_supported: ['aud', 'email', 'exp', 'iat', 'iss', 'name', 'sub'],
+			code_challenge_methods_supported: supportedCodeChallengeMethods,
+			grant_types_supported: ['authorization_code', 'client_credentials', 'password', 'refresh_token'],
+			id_token_signing_alg_values_supported: ['RS256'],
+			response_modes_supported: ['query'],
+			response_types_supported: ['code'],
+			scopes_supported: ['openid', 'profile', 'email'],
+			subject_types_supported: ['public'],
+			token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+			token_endpoint_auth_signing_alg_values_supported: ['RS256'],
+		});
+	};
 
 const handleJwks =
 	({jwk: {kty, alg, kid, e, n}}) =>
 	(req, res) =>
-		res.json({keys: [{kty, alg, kid, e, n}]});
+		res.json({keys: [{use: 'sig', kty, alg, kid, e, n}]});
 
 const handleAuthorize =
 	({users, codes, sessions}) =>
@@ -141,7 +203,7 @@ const handleAuthorize =
 		} else if (sessionId && sessions.has(sessionId)) {
 			const code = createToken();
 			codes.set(code, {sessionId, challenge, challengeMethod, scope, nonce, clientId});
-			res.redirect(`${redirectUri}?${new URLSearchParams({code, state})}`);
+			res.redirect(`${redirectUri}?${buildParams({code, state})}`);
 		} else {
 			res.setHeader('Cache-Control', 'no-cache').setHeader('Content-Type', 'text/html; charset=utf-8')
 				.end(`<!doctype html>
@@ -174,7 +236,7 @@ margin: 0 auto;
 <main>
 <form id="form" method="GET" action="/api/form">
 <h1>Mock Authentication</h1>
-<div>Client ID: <output>${clientId}</output></div>
+<div>Client ID: <output>${sanitize(clientId)}</output></div>
 <label for="sub">Subject:</label>
 <select id="sub" name="sub" autofocus>${renderOptions(users)}</select>
 <button type="submit">Authorize</button>
@@ -183,7 +245,7 @@ margin: 0 auto;
 </main>
 <script>
 var form = document.getElementById('form');
-var params = new URLSearchParams(${JSON.stringify({redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: challengeMethod, client_id: clientId, scope, state, nonce})});
+var params = new URLSearchParams(${toScriptJson({redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: challengeMethod, client_id: clientId, scope, state, nonce})});
 form.onsubmit = (event) => {
 	event.preventDefault();
 	params.set('sub', form.elements.sub.value);
@@ -200,9 +262,11 @@ form.error.onclick = () => {
 	};
 
 const handleToken =
-	({users, codes, sessions, ttl, jwk, signingKey}) =>
+	({users, clients, codes, sessions, ttl, issuer, jwk, signingKey}) =>
 	(req, res) => {
 		res.setHeader('Cache-Control', 'no-store');
+		// the client picks the authentication method, so the id does not always arrive in the body
+		const aud = getClientId(req);
 		switch (req.body.grant_type) {
 			case 'authorization_code': {
 				const {code, code_verifier: verifier} = req.body;
@@ -222,13 +286,19 @@ const handleToken =
 					return res.status(401).json({error: 'invalid_request', error_description: 'Session not found'});
 				}
 
-				return sendToken(req, res, session, jwk, signingKey, ttl, aud, scope, nonce);
+				return sendToken(req, res, session, issuer, jwk, signingKey, ttl, aud, scope, nonce);
 			}
 			case 'client_credentials': {
 				const {scope} = req.body;
-				return signJwt(buildHeader(jwk), {...buildBaseClaims(req, ttl), scope}, signingKey)
-					.then((access_token) => ({token_type: 'bearer', expires_in: ttl, access_token}))
-					.then((response) => res.json(response));
+				const client = clients.find((client) => client.sub === aud);
+				if (!client) {
+					return res.status(401).json({error: 'invalid_client', error_description: 'Client not found'});
+				}
+				const baseClaims = buildBaseClaims(req, issuer, ttl, client.aud);
+				const accessClaims = {...client, ...baseClaims, scope};
+				return signJwt(buildHeader(jwk), accessClaims, signingKey).then((access_token) =>
+					res.json({token_type: 'bearer', expires_in: ttl, access_token})
+				);
 			}
 			case 'password': {
 				const {username: sub, scope} = req.body;
@@ -238,23 +308,19 @@ const handleToken =
 				}
 
 				const sessionId = createToken();
-				const session = {id: sessionId, user};
+				const session = {id: sessionId, user, authTime: floor(Date.now() / 1000)};
 				sessions.set(sessionId, session);
-				return sendToken(req, res, session, jwk, signingKey, ttl, undefined, scope);
+				return sendToken(req, res, session, issuer, jwk, signingKey, ttl, aud, scope);
 			}
 			case 'refresh_token': {
-				const {client_id: aud, refresh_token: refreshToken, scope} = req.body;
-				const sessionId = req.cookies['mock-auth'];
-				const session = sessions.get(sessionId);
+				const {refresh_token: refreshToken, scope} = req.body;
+				// the token identifies the session; a cookie is not available to clients refreshing from a server
+				const session = sessions.values().find((s) => s.token && s.token === refreshToken);
 				if (!session) {
-					return res.status(401).json({error: 'login_required', error_description: 'Session not found'});
-				}
-				if (session.token !== refreshToken) {
-					session.token = null;
 					return res.status(401).json({error: 'login_required', error_description: 'Token not found'});
 				}
 
-				return sendToken(req, res, session, jwk, signingKey, ttl, aud, scope);
+				return sendToken(req, res, session, issuer, jwk, signingKey, ttl, aud, scope);
 			}
 		}
 		return res.status(401).json({error: 'invalid_request', error_description: 'Unexpected grant type'});
@@ -276,7 +342,7 @@ const handleRevoke =
 const handleEndSession =
 	({sessions}) =>
 	(req, res) =>
-		revokeSession(req, res, sessions, req.query.post_logout_redirect_uri);
+		revokeSession(req, res, sessions, req.query.post_logout_redirect_uri, req.query.state);
 
 const handleUserInfo =
 	({users}) =>
@@ -330,21 +396,28 @@ const handleForm =
 			state,
 			nonce,
 		} = req.query;
+		// without a redirect URI there is nowhere to report the outcome to
+		if (typeof redirectUri !== 'string') {
+			showErrorPage(res, 'A single redirect_uri is required.');
+			return;
+		}
+		const user = users.find((user) => user.sub === sub);
 		if (error) {
 			res.redirect(
-				`${redirectUri}?${new URLSearchParams({error: 'access_denied', error_description: 'Access has been denied'})}`
+				`${redirectUri}?${buildParams({error: 'access_denied', error_description: 'Access has been denied', state})}`
+			);
+		} else if (!user) {
+			res.redirect(
+				`${redirectUri}?${buildParams({error: 'invalid_request', error_description: 'The subject is not a known user', state})}`
 			);
 		} else {
 			const sessionId = createToken();
-			const user = users.find((user) => user.sub === sub);
-			const session = {id: sessionId, user};
+			const session = {id: sessionId, user, authTime: floor(Date.now() / 1000)};
 			sessions.set(sessionId, session);
 
 			const code = createToken();
 			codes.set(code, {sessionId, challenge, challengeMethod, scope, nonce, clientId});
-			res
-				.setHeader('Set-Cookie', buildCookie(sessionId))
-				.redirect(`${redirectUri}?${new URLSearchParams({code, state})}`);
+			res.setHeader('Set-Cookie', buildCookie(sessionId)).redirect(`${redirectUri}?${buildParams({code, state})}`);
 		}
 	};
 
@@ -372,23 +445,26 @@ const cors = (req, res, next) => {
 	next();
 };
 
-const configureApp = (ttl, users, jwk, signingKey) => {
+const configureApp = (ttl, users, clients, issuer, jwk, signingKey) => {
 	const context = {
 		codes: new Map(),
 		sessions: new Map(),
 		ttl,
 		users,
+		clients,
+		issuer,
 		jwk,
 		signingKey,
 	};
 	const app = express();
+	app.set('trust proxy', true);
 	app.use(morgan('dev'));
 	app.use(json({strict: true}));
 	app.use(urlencoded({extended: false}));
 	app.use(cookieParser());
 	app.use(cors);
 
-	app.get('/.well-known/openid-configuration', handleOpenidConfiguration);
+	app.get('/.well-known/openid-configuration', handleOpenidConfiguration(context));
 	app.get('/.well-known/jwks.json', handleJwks(context));
 	app.get('/authorize', handleAuthorize(context));
 	app.post('/oauth/token', handleToken(context));
@@ -420,17 +496,15 @@ const writeJwk = (jwk, filename) => {
 
 const createListener = (server, port, description) =>
 	new Promise((resolve, reject) => {
-		server.listen(port, (error) => {
-			if (error) {
-				reject(error);
-			} else {
-				console.log(description);
-				resolve();
-			}
+		server.once('error', reject);
+		server.listen(port, () => {
+			server.removeListener('error', reject);
+			console.log(description);
+			resolve();
 		});
 	});
 
-const start = (port, tlsPort, ttl, users, cert, tlsKey, loadedJwk, jwkSaveFile) =>
+const start = (port, tlsPort, ttl, users, clients, cert, tlsKey, issuer, loadedJwk, jwkSaveFile) =>
 	(loadedJwk ? Promise.resolve(loadedJwk) : generateJwk())
 		.then((jwk) => {
 			if (jwkSaveFile) {
@@ -439,7 +513,7 @@ const start = (port, tlsPort, ttl, users, cert, tlsKey, loadedJwk, jwkSaveFile) 
 			return importJWK(jwk).then((signingKey) => ({jwk, signingKey}));
 		})
 		.then(({jwk, signingKey}) => {
-			const app = configureApp(ttl, users, jwk, signingKey);
+			const app = configureApp(ttl, users, clients, issuer, jwk, signingKey);
 
 			const httpServer = createHttpServer(app);
 			const listeners = [createListener(httpServer, port, `HTTP server listening on port ${port}`)];
@@ -460,8 +534,10 @@ const main = () => {
 	let tlsPort = env.TLS_PORT ? +env.TLS_PORT : 8443;
 	let ttl = env.TTL ? +env.TTL : 300;
 	let usersFile = env.USERS_FILE;
+	let clientsFile = env.CLIENTS_FILE;
 	let certFile = env.CERT_FILE;
 	let keyFile = env.KEY_FILE;
+	let issuerUrl = env.ISSUER_URL;
 	let jwkFile = env.JWK_FILE;
 	let jwkSaveFile = false;
 	let error = null;
@@ -484,6 +560,10 @@ const main = () => {
 			case '--users':
 				usersFile = argv[i++];
 				break;
+			case '-l':
+			case '--clients':
+				clientsFile = argv[i++];
+				break;
 			case '-c':
 			case '--cert':
 				certFile = argv[i++];
@@ -491,6 +571,10 @@ const main = () => {
 			case '-k':
 			case '--key':
 				keyFile = argv[i++];
+				break;
+			case '-i':
+			case '--issuer':
+				issuerUrl = argv[i++];
 				break;
 			case '-j':
 			case '--jwk':
@@ -512,7 +596,7 @@ const main = () => {
 	if (help) {
 		if (error) console.error(`Unexpected argument: ${error}`);
 		console.error(
-			`Usage: ${argv[1]} [-p|--port <port>] [-s|--tls-port <TLS port>] [-t|--ttl <token ttl>] [-u|--users <YAML file>] [-c|--cert <SSL certificate>] [-k|--key <SSL key>] [-j|--jwk <JWK file>] [--save-jwk <JWK file>]`
+			`Usage: ${argv[1]} [-p|--port <port>] [-s|--tls-port <TLS port>] [-t|--ttl <token ttl>] [-u|--users <YAML file>] [-l|--clients <YAML file>] [-c|--cert <SSL certificate>] [-k|--key <SSL key>] [-i|--issuer <issuer URL>] [-j|--jwk <JWK file>] [--save-jwk <JWK file>]`
 		);
 		process.exit(1);
 	}
@@ -524,6 +608,11 @@ const main = () => {
 	if (usersFile) {
 		console.log(`Loading users from "${usersFile}"`);
 		users = parse(readFileSync(usersFile, 'utf8'));
+	}
+	let clients = defaultClients;
+	if (clientsFile) {
+		console.log(`Loading clients from "${clientsFile}"`);
+		clients = parse(readFileSync(clientsFile, 'utf8'));
 	}
 	let cert, tlsKey;
 	if (certFile) {
@@ -548,11 +637,13 @@ const main = () => {
 			jwk.alg = 'RS256';
 		}
 	}
-	process.once('SIGINT', () => {
+	const stop = () => {
 		console.log('Stopping server');
 		process.exit(0);
-	});
-	start(port, tlsPort, ttl, users, cert, tlsKey, jwk, jwkSaveFile).catch(
+	};
+	process.once('SIGINT', stop);
+	process.once('SIGTERM', stop);
+	start(port, tlsPort, ttl, users, clients, cert, tlsKey, issuerUrl, jwk, jwkSaveFile).catch(
 		(error) => (console.error(error), process.exit(1))
 	);
 };
