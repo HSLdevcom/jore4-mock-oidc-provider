@@ -1,9 +1,9 @@
-FROM node:22-alpine AS build
+FROM node:24-alpine AS build
 COPY . /app
 WORKDIR /app
 RUN npm ci --omit=dev
 
-FROM gcr.io/distroless/nodejs22-debian12
+FROM gcr.io/distroless/nodejs24-debian13
 EXPOSE 80
 EXPOSE 443
 ENV PORT=80

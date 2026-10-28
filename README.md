@@ -40,19 +40,41 @@ You can run the provider via `npx` or `docker`.
 
 The server can be configured either via command-line parameters or environment variables.
 
-| command line   | env var    | description                                                   | default |
-| -------------- | ---------- | ------------------------------------------------------------- | ------- |
-| -p, --port     | PORT       | port where the HTTP server will listen                        | 8092    |
-| -s, --tls-port | TLS_PORT   | port where the HTTPS server will listen (when TLS is enabled) | 8443    |
-| -t, --ttl      | TTL        | time to live for tokens (seconds)                             | 300     |
-| -u, --users    | USERS_FILE | path to a users YAML file                                     |         |
-| -c, --cert     | CERT_FILE  | TLS certificate file (see TLS section)                        |         |
-| -k, --key      | KEY_FILE   | TLS private key file (see TLS section)                        |         |
-| -j, --jwk      | JWK_FILE   | path to a JWK file used for signing tokens                    |         |
-| --save-jwk     |            | save the active JWK to the given file                         |         |
+| command line   | env var      | description                                                   | default |
+| -------------- | ------------ | ------------------------------------------------------------- | ------- |
+| -p, --port     | PORT         | port where the HTTP server will listen                        | 8092    |
+| -s, --tls-port | TLS_PORT     | port where the HTTPS server will listen (when TLS is enabled) | 8443    |
+| -t, --ttl      | TTL          | time to live for tokens (seconds)                             | 300     |
+| -u, --users    | USERS_FILE   | path to a users YAML file                                     |         |
+| -l, --clients  | CLIENTS_FILE | path to a clients YAML file                                   |         |
+| -c, --cert     | CERT_FILE    | TLS certificate file (see TLS section)                        |         |
+| -k, --key      | KEY_FILE     | TLS private key file (see TLS section)                        |         |
+| -i, --issuer   | ISSUER_URL   | static issuer URL to use instead of the request host          |         |
+| -j, --jwk      | JWK_FILE     | path to a JWK file used for signing tokens                    |         |
+| --save-jwk     |              | save the active JWK to the given file                         |         |
 
 If `--jwk` is not provided, a random RSA key is generated automatically.
 Use `--save-jwk <file>` to write the active JWK (whether generated or loaded) to a JSON file for later reuse.
+
+### Issuer
+
+The issuer is the value of the `issuer` field in the discovery document and of the `iss` claim in every token.
+It also determines the endpoint URLs published in the discovery document, so that they always agree with each other.
+
+If `--issuer` is not provided, the issuer is derived from each request as `<protocol>://<host>/`
+(ending in `/` for Auth0 compatibility). A value passed to `--issuer` is used verbatim.
+
+#### Behind a reverse proxy
+
+The `X-Forwarded-Proto` and `X-Forwarded-Host` headers are honored, so a provider running behind a
+TLS-terminating proxy advertises the external `https://` URLs rather than the internal ones it is reached at:
+
+```
+issuer                 https://auth.example.com/
+authorization_endpoint https://auth.example.com/authorize
+```
+
+These headers are accepted from **any** client, which means a caller can influence the advertised URLs. Set `--issuer` to pin the issuer to a fixed value regardless of the incoming headers.
 
 ### Users
 
@@ -89,6 +111,27 @@ Users file format (YAML):
     name: Miny
   accessClaims:
     mock: c
+```
+
+### Clients
+
+By default, one client is provided (`baz`).
+If a clients file is supplied, it **replaces** the default clients.
+
+Clients file format (YAML):
+
+- The top-level value must be an array.
+- Each array entry must be an object containing:
+  - `sub` (string): the client identifier.
+  - Optional additional claims to be included in access tokens.
+
+#### Example
+
+```yaml
+- sub: service-a
+  role: machine
+- sub: service-b
+  team: platform
 ```
 
 ### TLS
